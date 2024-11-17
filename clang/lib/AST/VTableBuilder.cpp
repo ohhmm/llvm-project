@@ -54,7 +54,8 @@ public:
   /// Get the address of a lambda's call operator with template support
   void *getLambdaAddress(const CXXMethodDecl *CallOp,
                         const TemplateParameterList *TPL = nullptr,
-                        bool IsMutable = false) const {
+                        bool IsMutable = false,
+                        const CXXRecordDecl *InheritedFrom = nullptr) const {
     if (!CallOp || !CallOp->getParent()->isLambda())
       return nullptr;
 
@@ -68,12 +69,18 @@ public:
       return Context.getTemplateFunctionAddress(CallOp, TPL);
     }
 
+    // Handle inheritance cases
+    if (InheritedFrom) {
+      return Context.getInheritedFunctionAddress(CallOp, InheritedFrom);
+    }
+
     return Context.getFunctionAddress(CallOp);
   }
 
   /// Get the address of a std::function object with template support
   void *getStdFunctionAddress(const FunctionDecl *FD,
-                             const TemplateParameterList *TPL = nullptr) const {
+                             const TemplateParameterList *TPL = nullptr,
+                             const CXXRecordDecl *InheritedFrom = nullptr) const {
     if (!FD) return nullptr;
 
     // Handle template parameters if present
@@ -81,7 +88,32 @@ public:
       return Context.getTemplateFunctionAddress(FD, TPL);
     }
 
+    // Handle inheritance cases
+    if (InheritedFrom) {
+      return Context.getInheritedFunctionAddress(FD, InheritedFrom);
+    }
+
     return Context.getFunctionAddress(FD);
+  }
+
+  /// Get the address for a virtual method with template parameters
+  void *getVirtualMethodAddress(const CXXMethodDecl *MD,
+                               const TemplateParameterList *TPL = nullptr,
+                               const CXXRecordDecl *InheritedFrom = nullptr) const {
+    if (!MD || !MD->isVirtual())
+      return nullptr;
+
+    // Handle template parameters if present
+    if (TPL) {
+      return Context.getTemplateFunctionAddress(MD, TPL);
+    }
+
+    // Handle inheritance cases
+    if (InheritedFrom) {
+      return Context.getInheritedFunctionAddress(MD, InheritedFrom);
+    }
+
+    return Context.getFunctionAddress(MD);
   }
 };
 
@@ -905,16 +937,39 @@ private:
     /// (For destructors, this is the index of the complete destructor).
     const uint64_t VTableIndex;
 
+    /// StaticFuncPtr - The static function pointer if this is a static function
+    const void *StaticFuncPtr;
+
+    /// TemplateParams - Template parameters for this method
+    const TemplateParameterList *TemplateParams;
+
+    /// InheritedFrom - The class this method was inherited from (if any)
+    const CXXRecordDecl *InheritedFrom;
+
+    /// IsMutableLambda - Whether this is a mutable lambda
+    bool IsMutableLambda;
+
     MethodInfo(CharUnits BaseOffset, CharUnits BaseOffsetInLayoutClass,
-               uint64_t VTableIndex)
+               uint64_t VTableIndex, const void *StaticFuncPtr = nullptr,
+               const TemplateParameterList *TPL = nullptr,
+               const CXXRecordDecl *InheritedFrom = nullptr,
+               bool IsMutableLambda = false)
       : BaseOffset(BaseOffset),
-      BaseOffsetInLayoutClass(BaseOffsetInLayoutClass),
-      VTableIndex(VTableIndex) { }
+        BaseOffsetInLayoutClass(BaseOffsetInLayoutClass),
+        VTableIndex(VTableIndex),
+        StaticFuncPtr(StaticFuncPtr),
+        TemplateParams(TPL),
+        InheritedFrom(InheritedFrom),
+        IsMutableLambda(IsMutableLambda) { }
 
     MethodInfo()
       : BaseOffset(CharUnits::Zero()),
-      BaseOffsetInLayoutClass(CharUnits::Zero()),
-      VTableIndex(0) { }
+        BaseOffsetInLayoutClass(CharUnits::Zero()),
+        VTableIndex(0),
+        StaticFuncPtr(nullptr),
+        TemplateParams(nullptr),
+        InheritedFrom(nullptr),
+        IsMutableLambda(false) { }
 
     MethodInfo(MethodInfo const&) = default;
   };
