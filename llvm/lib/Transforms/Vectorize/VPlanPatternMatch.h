@@ -152,6 +152,7 @@ struct MatchRecipeAndOpcode<Opcode, RecipeTy, RecipeTys...> {
 };
 template <typename TupleTy, typename Fn, std::size_t... Is>
 bool CheckTupleElements(const TupleTy &Ops, Fn P, std::index_sequence<Is...>) {
+  [[maybe_unused]] const auto &Pred = P;  // Explicitly mark P as used
   return (P(std::get<Is>(Ops), Is) && ...);
 }
 

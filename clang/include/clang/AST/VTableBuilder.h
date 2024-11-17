@@ -219,31 +219,30 @@ public:
   bool isRTTIKind() const { return isRTTIKind(getKind()); }
 
   GlobalDecl getGlobalDecl() const {
-    assert(isUsedFunctionPointerKind() &&
-           "GlobalDecl can be created only from virtual function");
+    assert((isUsedFunctionPointerKind() || isRTTIKind()) &&
+           "Invalid component kind!");
 
-    auto *DtorDecl = dyn_cast<CXXDestructorDecl>(getFunctionDecl());
     switch (getKind()) {
     case CK_FunctionPointer:
-      return GlobalDecl(getFunctionDecl());
     case CK_CompleteDtorPointer:
-      return GlobalDecl(DtorDecl, CXXDtorType::Dtor_Complete);
     case CK_DeletingDtorPointer:
-      return GlobalDecl(DtorDecl, CXXDtorType::Dtor_Deleting);
+      return GlobalDecl(getFunctionDecl());
+    case CK_UnusedFunctionPointer:
+      return GlobalDecl(getUnusedFunctionDecl());
+    case CK_RTTI:
+      return GlobalDecl();
     case CK_StdFunction:
       if (auto *MD = dyn_cast<CXXMethodDecl>(getStdFunctionDecl()))
         return GlobalDecl(MD);
-      llvm_unreachable("StdFunction must contain a method declaration");
+      return GlobalDecl();
     case CK_Lambda:
       return GlobalDecl(getLambdaDecl());
-    case CK_VCallOffset:
-    case CK_VBaseOffset:
-    case CK_OffsetToTop:
-    case CK_RTTI:
-    case CK_UnusedFunctionPointer:
-      llvm_unreachable("Only function pointers kinds");
+    case CK_TemplateParamInfo:
+      // Template parameter info doesn't have an associated global declaration
+      return GlobalDecl();
+    default:
+      llvm_unreachable("Invalid component kind!");
     }
-    llvm_unreachable("Should already return");
   }
 
 private:

@@ -2101,6 +2101,31 @@ void ItaniumVTableBuilder::dumpLayout(raw_ostream &Out) {
       break;
     }
 
+    case VTableComponent::CK_StdFunction: {
+      const FunctionDecl *FD = Component.getStdFunctionDecl();
+      std::string Str;
+      if (auto *MD = dyn_cast<CXXMethodDecl>(FD)) {
+        Str = PredefinedExpr::ComputeName(
+            PredefinedIdentKind::PrettyFunctionNoVirtual, MD);
+      } else {
+        Str = FD->getNameAsString();
+      }
+      Out << "[std::function] " << Str;
+      if (Component.hasTemplateParams())
+        Out << " [templated]";
+      break;
+    }
+
+    case VTableComponent::CK_Lambda: {
+      const CXXMethodDecl *MD = Component.getLambdaDecl();
+      std::string Str = PredefinedExpr::ComputeName(
+          PredefinedIdentKind::PrettyFunctionNoVirtual, MD);
+      Out << "[lambda] " << Str;
+      if (Component.hasTemplateParams())
+        Out << " [templated]";
+      break;
+    }
+
     case VTableComponent::CK_UnusedFunctionPointer: {
       const CXXMethodDecl *MD = Component.getUnusedFunctionDecl();
 
