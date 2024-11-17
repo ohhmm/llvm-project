@@ -49,6 +49,12 @@ public:
     /// CK_UnusedFunctionPointer.
     CK_UnusedFunctionPointer,
 
+    /// A std::function type that can hold functors with templated operator().
+    CK_StdFunction,
+
+    /// A lambda type that can have a templated operator().
+    CK_Lambda,
+
     /// Template parameter information used during compilation.
     ///
     /// This component stores information about template parameters
@@ -100,6 +106,19 @@ public:
                            reinterpret_cast<uintptr_t>(MD));
   }
 
+  static VTableComponent MakeStdFunction(const FunctionDecl *FD) {
+    assert(FD && "StdFunction requires a valid function declaration!");
+    return VTableComponent(CK_StdFunction,
+                           reinterpret_cast<uintptr_t>(FD));
+  }
+
+  static VTableComponent MakeLambda(const CXXMethodDecl *CallOp) {
+    assert(CallOp && CallOp->getParent()->isLambda() &&
+           "Lambda requires a valid call operator from a lambda!");
+    return VTableComponent(CK_Lambda,
+                           reinterpret_cast<uintptr_t>(CallOp));
+  }
+
   static VTableComponent MakeTemplateParamInfo() {
     return VTableComponent(CK_TemplateParamInfo, 0);
   }
@@ -136,6 +155,14 @@ public:
     assert(isFunctionPointerKind() && "Invalid component kind!");
     if (isDestructorKind())
       return getDestructorDecl();
+    if (isLambdaKind())
+      return getLambdaDecl();
+    if (isStdFunctionKind()) {
+      auto *FD = getStdFunctionDecl();
+      if (auto *MD = dyn_cast<CXXMethodDecl>(FD))
+        return MD;
+      return nullptr;
+    }
     return reinterpret_cast<CXXMethodDecl *>(getPointer());
   }
 
@@ -149,16 +176,46 @@ public:
     return reinterpret_cast<CXXMethodDecl *>(getPointer());
   }
 
-  bool isDestructorKind() const { return isDestructorKind(getKind()); }
+  const FunctionDecl *getStdFunctionDecl() const {
+    assert(isStdFunctionKind() && "Invalid component kind!");
+    return reinterpret_cast<FunctionDecl *>(getPointer());
+  }
 
+  const CXXMethodDecl *getLambdaDecl() const {
+    assert(isLambdaKind() && "Invalid component kind!");
+    return reinterpret_cast<CXXMethodDecl *>(getPointer());
+  }
+
+  // Get the template parameters for std::function or lambda operator()
+  const TemplateParameterList *getTemplateParams() const {
+    if (isStdFunctionKind()) {
+      if (auto *MD = dyn_cast<CXXMethodDecl>(getStdFunctionDecl())) {
+        if (auto *FT = MD->getDescribedFunctionTemplate())
+          return FT->getTemplateParameters();
+      }
+    } else if (isLambdaKind()) {
+      if (auto *CallOp = getLambdaDecl()) {
+        if (auto *FT = CallOp->getDescribedFunctionTemplate())
+          return FT->getTemplateParameters();
+      }
+    }
+    return nullptr;
+  }
+
+  // Check if the component has template parameters
+  bool hasTemplateParams() const {
+    return getTemplateParams() != nullptr;
+  }
+
+  bool isStdFunctionKind() const { return getKind() == CK_StdFunction; }
+  bool isLambdaKind() const { return getKind() == CK_Lambda; }
+  bool isDestructorKind() const { return isDestructorKind(getKind()); }
   bool isUsedFunctionPointerKind() const {
     return isUsedFunctionPointerKind(getKind());
   }
-
   bool isFunctionPointerKind() const {
     return isFunctionPointerKind(getKind());
   }
-
   bool isRTTIKind() const { return isRTTIKind(getKind()); }
 
   GlobalDecl getGlobalDecl() const {
@@ -173,6 +230,12 @@ public:
       return GlobalDecl(DtorDecl, CXXDtorType::Dtor_Complete);
     case CK_DeletingDtorPointer:
       return GlobalDecl(DtorDecl, CXXDtorType::Dtor_Deleting);
+    case CK_StdFunction:
+      if (auto *MD = dyn_cast<CXXMethodDecl>(getStdFunctionDecl()))
+        return GlobalDecl(MD);
+      llvm_unreachable("StdFunction must contain a method declaration");
+    case CK_Lambda:
+      return GlobalDecl(getLambdaDecl());
     case CK_VCallOffset:
     case CK_VBaseOffset:
     case CK_OffsetToTop:
@@ -186,10 +249,14 @@ public:
 private:
   static bool isFunctionPointerKind(Kind ComponentKind) {
     return isUsedFunctionPointerKind(ComponentKind) ||
-           ComponentKind == CK_UnusedFunctionPointer;
+           ComponentKind == CK_UnusedFunctionPointer ||
+           ComponentKind == CK_StdFunction ||
+           ComponentKind == CK_Lambda;
   }
   static bool isUsedFunctionPointerKind(Kind ComponentKind) {
     return ComponentKind == CK_FunctionPointer ||
+           ComponentKind == CK_StdFunction ||
+           ComponentKind == CK_Lambda ||
            isDestructorKind(ComponentKind);
   }
   static bool isDestructorKind(Kind ComponentKind) {
@@ -214,9 +281,17 @@ private:
     assert((isRTTIKind(ComponentKind) || isFunctionPointerKind(ComponentKind)) &&
            "Invalid component kind!");
 
-    assert((Ptr & 7) == 0 && "Pointer not sufficiently aligned!");
-
-    Value = Ptr | ComponentKind;
+    // For std::function and lambda types, we need to ensure the pointer
+    // contains the necessary template parameter information in the aligned bits
+    if (ComponentKind == CK_StdFunction || ComponentKind == CK_Lambda) {
+      assert((Ptr & 7) == 0 && "Pointer not sufficiently aligned for template info!");
+      // Store the pointer with template parameter information
+      // The lower 3 bits are used for the component kind
+      Value = (Ptr & ~7ULL) | ComponentKind;
+    } else {
+      assert((Ptr & 7) == 0 && "Pointer not sufficiently aligned!");
+      Value = Ptr | ComponentKind;
+    }
   }
 
   CharUnits getOffset() const {
