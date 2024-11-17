@@ -766,6 +766,14 @@ void CodeGenVTables::addVTableComponent(ConstantArrayBuilder &builder,
     else
       return builder.add(rtti);
 
+  case VTableComponent::CK_TemplateParamInfo:
+    // Template parameter information is only used during compilation
+    // and doesn't need runtime representation
+    if (useRelativeLayout())
+      return builder.add(llvm::ConstantExpr::getNullValue(CGM.Int32Ty));
+    else
+      return builder.addNullPointer(CGM.GlobalsInt8PtrTy);
+
   case VTableComponent::CK_FunctionPointer:
   case VTableComponent::CK_CompleteDtorPointer:
   case VTableComponent::CK_DeletingDtorPointer: {

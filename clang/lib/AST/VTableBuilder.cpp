@@ -2015,6 +2015,10 @@ void ItaniumVTableBuilder::dumpLayout(raw_ostream &Out) {
       Out << " RTTI";
       break;
 
+    case VTableComponent::CK_TemplateParamInfo:
+      Out << "template_param_info";
+      break;
+
     case VTableComponent::CK_FunctionPointer: {
       const CXXMethodDecl *MD = Component.getFunctionDecl();
 

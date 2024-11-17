@@ -47,7 +47,14 @@ public:
     /// In some cases, a vtable function pointer will end up never being
     /// called. Such vtable function pointers are represented as a
     /// CK_UnusedFunctionPointer.
-    CK_UnusedFunctionPointer
+    CK_UnusedFunctionPointer,
+
+    /// Template parameter information used during compilation.
+    ///
+    /// This component stores information about template parameters
+    /// that is only needed during compilation and doesn't require
+    /// runtime representation.
+    CK_TemplateParamInfo
   };
 
   VTableComponent() = default;
@@ -91,6 +98,10 @@ public:
            "Don't use MakeUnusedFunction with destructors!");
     return VTableComponent(CK_UnusedFunctionPointer,
                            reinterpret_cast<uintptr_t>(MD));
+  }
+
+  static VTableComponent MakeTemplateParamInfo() {
+    return VTableComponent(CK_TemplateParamInfo, 0);
   }
 
   /// Get the kind of this vtable component.
