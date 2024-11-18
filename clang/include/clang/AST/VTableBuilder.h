@@ -702,7 +702,7 @@ struct MethodVFTableLocation {
 class MicrosoftVTableContext : public VTableContextBase {
 public:
   MicrosoftVTableContext(ASTContext &Context)
-      : VTableContextBase(), Context(Context) {}
+      : VTableContextBase(/*MS=*/true), Context(Context) {}
 
   ~MicrosoftVTableContext() override;
 
