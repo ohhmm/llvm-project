@@ -766,6 +766,14 @@ void CodeGenVTables::addVTableComponent(ConstantArrayBuilder &builder,
     else
       return builder.add(rtti);
 
+  case VTableComponent::CK_TemplateParamInfo:
+    // Template parameter information is only used during compilation
+    // and doesn't need runtime representation
+    if (useRelativeLayout())
+      return builder.add(llvm::ConstantExpr::getNullValue(CGM.Int32Ty));
+    else
+      return builder.addNullPointer(CGM.GlobalsInt8PtrTy);
+
   case VTableComponent::CK_FunctionPointer:
   case VTableComponent::CK_CompleteDtorPointer:
   case VTableComponent::CK_DeletingDtorPointer: {
@@ -877,6 +885,30 @@ void CodeGenVTables::addVTableComponent(ConstantArrayBuilder &builder,
       return builder.add(llvm::ConstantExpr::getNullValue(CGM.Int32Ty));
     else
       return builder.addNullPointer(CGM.GlobalsInt8PtrTy);
+
+  case VTableComponent::CK_StdFunction:
+  case VTableComponent::CK_Lambda: {
+    // Handle std::function and lambda components similarly to function pointers
+    GlobalDecl GD = component.getGlobalDecl();
+    llvm::Type *fnTy = CGM.getTypes().GetFunctionTypeForVTable(GD);
+    llvm::Constant *fnPtr = CGM.GetAddrOfFunction(GD, fnTy, /*ForVTable=*/true);
+
+    if (useRelativeLayout()) {
+      return addRelativeComponent(
+          builder, fnPtr, vtableAddressPoint, vtableHasLocalLinkage,
+          /*isCompleteDtor=*/false);
+    } else {
+      unsigned FnAS = fnPtr->getType()->getPointerAddressSpace();
+      unsigned GVAS = CGM.GlobalsInt8PtrTy->getPointerAddressSpace();
+
+      if (FnAS != GVAS)
+        fnPtr = llvm::ConstantExpr::getAddrSpaceCast(fnPtr, CGM.GlobalsInt8PtrTy);
+      if (const auto &Schema =
+          CGM.getCodeGenOpts().PointerAuth.CXXVirtualFunctionPointers)
+        return builder.addSignedPointer(fnPtr, Schema, GD, QualType());
+      return builder.add(fnPtr);
+    }
+  }
   }
 
   llvm_unreachable("Unexpected vtable component kind");

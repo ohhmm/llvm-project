@@ -1,4 +1,4 @@
-//===--- VTableBuilder.h - C++ vtable layout builder --------------*- C++ -*-=//
+//===- VTableBuilder.h - C++ vtable layout builder --------------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -20,11 +20,17 @@
 #include "clang/Basic/ABI.h"
 #include "clang/Basic/Thunk.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/Support/raw_ostream.h"
 #include <memory>
 #include <utility>
 
 namespace clang {
-  class CXXRecordDecl;
+class CXXRecordDecl;
+class ASTContext;
+class FunctionDecl;
+class CXXMethodDecl;
+class CXXDestructorDecl;
+class TemplateParameterList;
 
 /// Represents a single component in a vtable.
 class VTableComponent {
@@ -47,187 +53,355 @@ public:
     /// In some cases, a vtable function pointer will end up never being
     /// called. Such vtable function pointers are represented as a
     /// CK_UnusedFunctionPointer.
-    CK_UnusedFunctionPointer
+    CK_UnusedFunctionPointer,
+
+    /// A static function pointer that can be called directly.
+    CK_StaticFunctionPointer,
+
+    /// A static lambda that can be called directly.
+    CK_StaticLambda,
+
+    /// A static std::function object's address.
+    CK_StaticStdFunction,
+
+    /// A virtual method with template parameters.
+    CK_VirtualTemplateMethod,
+
+    /// A virtual method that is inherited through virtual inheritance.
+    CK_VirtualInheritedMethod,
+
+    /// Template parameter information used during compilation.
+    ///
+    /// This component stores information about template parameters
+    /// that is only needed during compilation and doesn't require
+    /// runtime representation.
+    CK_TemplateParamInfo
   };
 
-  VTableComponent() = default;
+private:
+  Kind TheKind;
+  union {
+    CharUnits Offset;
+    const void *Ptr;
+    const TemplateParameterList *TemplateParams;
+    struct {
+      const void *FuncPtr;           // Function pointer or address
+      const void *TemplateInfo;      // Template parameters if any
+      const void *InheritanceInfo;   // Base class info for inheritance
+      const void *VirtualInfo;       // Virtual inheritance info
+    } StaticFunc;
+  };
+
+  bool IsMutable;
+  bool HasTemplateParams;
+  bool IsVirtualInherited;
+  bool IsVirtualTemplate;
+
+public:
+  VTableComponent()
+    : TheKind(CK_FunctionPointer),
+      Ptr(nullptr),
+      IsMutable(false),
+      HasTemplateParams(false),
+      IsVirtualInherited(false),
+      IsVirtualTemplate(false) {}
 
   static VTableComponent MakeVCallOffset(CharUnits Offset) {
-    return VTableComponent(CK_VCallOffset, Offset);
+    VTableComponent Result;
+    Result.TheKind = CK_VCallOffset;
+    Result.Offset = Offset;
+    return Result;
   }
 
   static VTableComponent MakeVBaseOffset(CharUnits Offset) {
-    return VTableComponent(CK_VBaseOffset, Offset);
+    VTableComponent Result;
+    Result.TheKind = CK_VBaseOffset;
+    Result.Offset = Offset;
+    return Result;
   }
 
   static VTableComponent MakeOffsetToTop(CharUnits Offset) {
-    return VTableComponent(CK_OffsetToTop, Offset);
+    VTableComponent Result;
+    Result.TheKind = CK_OffsetToTop;
+    Result.Offset = Offset;
+    return Result;
   }
 
   static VTableComponent MakeRTTI(const CXXRecordDecl *RD) {
-    return VTableComponent(CK_RTTI, reinterpret_cast<uintptr_t>(RD));
+    VTableComponent Result;
+    Result.TheKind = CK_RTTI;
+    Result.Ptr = RD;
+    return Result;
   }
 
   static VTableComponent MakeFunction(const CXXMethodDecl *MD) {
-    assert(!isa<CXXDestructorDecl>(MD) &&
-           "Don't use MakeFunction with destructors!");
-
-    return VTableComponent(CK_FunctionPointer,
-                           reinterpret_cast<uintptr_t>(MD));
+    VTableComponent Result;
+    Result.TheKind = CK_FunctionPointer;
+    Result.Ptr = MD;
+    return Result;
   }
 
   static VTableComponent MakeCompleteDtor(const CXXDestructorDecl *DD) {
-    return VTableComponent(CK_CompleteDtorPointer,
-                           reinterpret_cast<uintptr_t>(DD));
+    VTableComponent Result;
+    Result.TheKind = CK_CompleteDtorPointer;
+    Result.Ptr = DD;
+    return Result;
   }
 
   static VTableComponent MakeDeletingDtor(const CXXDestructorDecl *DD) {
-    return VTableComponent(CK_DeletingDtorPointer,
-                           reinterpret_cast<uintptr_t>(DD));
+    VTableComponent Result;
+    Result.TheKind = CK_DeletingDtorPointer;
+    Result.Ptr = DD;
+    return Result;
   }
 
   static VTableComponent MakeUnusedFunction(const CXXMethodDecl *MD) {
-    assert(!isa<CXXDestructorDecl>(MD) &&
-           "Don't use MakeUnusedFunction with destructors!");
-    return VTableComponent(CK_UnusedFunctionPointer,
-                           reinterpret_cast<uintptr_t>(MD));
+    VTableComponent Result;
+    Result.TheKind = CK_UnusedFunctionPointer;
+    Result.Ptr = MD;
+    return Result;
   }
 
-  /// Get the kind of this vtable component.
-  Kind getKind() const {
-    return (Kind)(Value & 0x7);
+  static VTableComponent MakeStaticFunction(const FunctionDecl *FD,
+                                         ASTContext &Context,
+                                         const void *Addr = nullptr,
+                                         const CXXRecordDecl *InheritedFrom = nullptr,
+                                         bool IsVirtual = false) {
+    VTableComponent Result;
+    Result.TheKind = CK_StaticFunctionPointer;
+    Result.StaticFunc.FuncPtr = Addr ? Addr : FD;
+    Result.StaticFunc.TemplateInfo = nullptr;
+    Result.StaticFunc.InheritanceInfo = InheritedFrom;
+    Result.IsVirtualInherited = IsVirtual;
+    Result.HasTemplateParams = false;
+    Result.IsMutable = false;
+    return Result;
   }
+
+  static VTableComponent MakeStaticLambda(const CXXMethodDecl *CallOp,
+                                         ASTContext &Context,
+                                         bool IsMutable = false,
+                                         const void *Addr = nullptr,
+                                         const CXXRecordDecl *InheritedFrom = nullptr,
+                                         bool IsVirtual = false) {
+    VTableComponent Result;
+    Result.TheKind = CK_StaticLambda;
+    Result.StaticFunc.FuncPtr = Addr ? Addr : CallOp;
+    Result.StaticFunc.TemplateInfo = nullptr;
+    Result.StaticFunc.InheritanceInfo = InheritedFrom;
+    Result.IsVirtualInherited = IsVirtual;
+    Result.HasTemplateParams = false;
+    Result.IsMutable = IsMutable;
+    return Result;
+  }
+
+  static VTableComponent MakeStaticStdFunction(const FunctionDecl *FD,
+                                              ASTContext &Context,
+                                              const TemplateParameterList *TPL = nullptr,
+                                              const void *Addr = nullptr,
+                                              const CXXRecordDecl *InheritedFrom = nullptr) {
+    VTableComponent Result;
+    Result.TheKind = CK_StaticStdFunction;
+    Result.StaticFunc.FuncPtr = Addr ? Addr : FD;
+    Result.StaticFunc.TemplateInfo = TPL;
+    Result.StaticFunc.InheritanceInfo = InheritedFrom;
+    Result.StaticFunc.VirtualInfo = nullptr;
+    Result.IsVirtualInherited = false;
+    Result.HasTemplateParams = TPL != nullptr;
+    Result.IsMutable = false;
+    Result.IsVirtualTemplate = false;
+    return Result;
+  }
+
+  static VTableComponent MakeVirtualTemplateMethod(const CXXMethodDecl *MD,
+                                                   const TemplateParameterList *TPL,
+                                                   const void *Addr = nullptr,
+                                                   const CXXRecordDecl *InheritedFrom = nullptr) {
+    VTableComponent Result;
+    Result.TheKind = CK_VirtualTemplateMethod;
+    Result.StaticFunc.FuncPtr = Addr ? Addr : MD;
+    Result.StaticFunc.TemplateInfo = TPL;
+    Result.StaticFunc.InheritanceInfo = InheritedFrom;
+    Result.StaticFunc.VirtualInfo = nullptr;
+    Result.IsVirtualInherited = false;
+    Result.HasTemplateParams = true;
+    Result.IsMutable = false;
+    Result.IsVirtualTemplate = true;
+    return Result;
+  }
+
+  static VTableComponent MakeVirtualInheritedMethod(const CXXMethodDecl *MD,
+                                                    const CXXRecordDecl *VBase,
+                                                    const void *Addr = nullptr,
+                                                    const CXXRecordDecl *InheritedFrom = nullptr) {
+    VTableComponent Result;
+    Result.TheKind = CK_VirtualInheritedMethod;
+    Result.StaticFunc.FuncPtr = Addr ? Addr : MD;
+    Result.StaticFunc.TemplateInfo = nullptr;
+    Result.StaticFunc.InheritanceInfo = InheritedFrom;
+    Result.StaticFunc.VirtualInfo = VBase;
+    Result.IsVirtualInherited = true;
+    Result.HasTemplateParams = false;
+    Result.IsMutable = false;
+    Result.IsVirtualTemplate = false;
+    return Result;
+  }
+
+  static VTableComponent MakeTemplateParamInfo(const TemplateParameterList *TPL,
+                                              const CXXRecordDecl *InheritedFrom = nullptr) {
+    VTableComponent Result;
+    Result.TheKind = CK_TemplateParamInfo;
+    Result.TemplateParams = TPL;
+    Result.StaticFunc.InheritanceInfo = InheritedFrom;
+    Result.HasTemplateParams = true;
+    return Result;
+  }
+
+  Kind getKind() const { return TheKind; }
 
   CharUnits getVCallOffset() const {
-    assert(getKind() == CK_VCallOffset && "Invalid component kind!");
-
-    return getOffset();
+    assert(TheKind == CK_VCallOffset && "Invalid component kind!");
+    return Offset;
   }
 
   CharUnits getVBaseOffset() const {
-    assert(getKind() == CK_VBaseOffset && "Invalid component kind!");
-
-    return getOffset();
+    assert(TheKind == CK_VBaseOffset && "Invalid component kind!");
+    return Offset;
   }
 
   CharUnits getOffsetToTop() const {
-    assert(getKind() == CK_OffsetToTop && "Invalid component kind!");
-
-    return getOffset();
+    assert(TheKind == CK_OffsetToTop && "Invalid component kind!");
+    return Offset;
   }
 
   const CXXRecordDecl *getRTTIDecl() const {
-    assert(isRTTIKind() && "Invalid component kind!");
-    return reinterpret_cast<CXXRecordDecl *>(getPointer());
+    assert(TheKind == CK_RTTI && "Invalid component kind!");
+    return static_cast<const CXXRecordDecl *>(Ptr);
   }
 
   const CXXMethodDecl *getFunctionDecl() const {
-    assert(isFunctionPointerKind() && "Invalid component kind!");
-    if (isDestructorKind())
-      return getDestructorDecl();
-    return reinterpret_cast<CXXMethodDecl *>(getPointer());
+    assert(TheKind == CK_FunctionPointer && "Invalid component kind!");
+    return static_cast<const CXXMethodDecl *>(Ptr);
   }
 
-  const CXXDestructorDecl *getDestructorDecl() const {
-    assert(isDestructorKind() && "Invalid component kind!");
-    return reinterpret_cast<CXXDestructorDecl *>(getPointer());
+  const FunctionDecl *getStaticFunctionDecl() const {
+    assert(TheKind == CK_StaticFunctionPointer && "Invalid component kind!");
+    return static_cast<const FunctionDecl *>(StaticFunc.FuncPtr);
   }
 
-  const CXXMethodDecl *getUnusedFunctionDecl() const {
-    assert(getKind() == CK_UnusedFunctionPointer && "Invalid component kind!");
-    return reinterpret_cast<CXXMethodDecl *>(getPointer());
+  const CXXMethodDecl *getStaticLambdaDecl() const {
+    assert(TheKind == CK_StaticLambda && "Invalid component kind!");
+    return static_cast<const CXXMethodDecl *>(StaticFunc.FuncPtr);
   }
 
-  bool isDestructorKind() const { return isDestructorKind(getKind()); }
+  const FunctionDecl *getStaticStdFunctionDecl() const {
+    assert(TheKind == CK_StaticStdFunction && "Invalid component kind!");
+    return static_cast<const FunctionDecl *>(StaticFunc.FuncPtr);
+  }
 
-  bool isUsedFunctionPointerKind() const {
+  const CXXMethodDecl *getVirtualTemplateMethodDecl() const {
+    assert(TheKind == CK_VirtualTemplateMethod && "Invalid component kind!");
+    return static_cast<const CXXMethodDecl *>(StaticFunc.FuncPtr);
+  }
+
+  const CXXMethodDecl *getVirtualInheritedMethodDecl() const {
+    assert(TheKind == CK_VirtualInheritedMethod && "Invalid component kind!");
+    return static_cast<const CXXMethodDecl *>(StaticFunc.FuncPtr);
+  }
+
+  const CXXRecordDecl *getVirtualBaseClass() const {
+    assert(TheKind == CK_VirtualInheritedMethod && "Invalid component kind!");
+    return static_cast<const CXXRecordDecl *>(StaticFunc.VirtualInfo);
+  }
+
+  const TemplateParameterList *getTemplateParams() const {
+    assert((TheKind == CK_TemplateParamInfo || TheKind == CK_VirtualTemplateMethod) &&
+           "Invalid component kind!");
+    return TheKind == CK_TemplateParamInfo ? TemplateParams :
+           static_cast<const TemplateParameterList *>(StaticFunc.TemplateInfo);
+  }
+
+  bool isStaticKind() const {
+    return TheKind == CK_StaticFunctionPointer ||
+           TheKind == CK_StaticLambda ||
+           TheKind == CK_StaticStdFunction;
+  }
+
+  bool isVirtualKind() const {
+    return TheKind == CK_VirtualTemplateMethod ||
+           TheKind == CK_VirtualInheritedMethod;
+  }
+
+  bool isMutableLambda() const {
+    return TheKind == CK_StaticLambda && IsMutable;
+  }
+
+  bool isVirtualTemplateMethod() const {
+    return TheKind == CK_VirtualTemplateMethod;
+  }
+
+  bool isVirtualInheritedMethod() const {
+    return TheKind == CK_VirtualInheritedMethod;
+  }
+
+  const void *getStaticFuncPtr() const {
+    assert((isStaticKind() || isVirtualKind()) && "Invalid component kind!");
+    return StaticFunc.FuncPtr;
+  }
+
+  bool isUsedFunctionPointer() const {
     return isUsedFunctionPointerKind(getKind());
   }
 
-  bool isFunctionPointerKind() const {
-    return isFunctionPointerKind(getKind());
-  }
-
-  bool isRTTIKind() const { return isRTTIKind(getKind()); }
-
-  GlobalDecl getGlobalDecl() const {
-    assert(isUsedFunctionPointerKind() &&
-           "GlobalDecl can be created only from virtual function");
-
-    auto *DtorDecl = dyn_cast<CXXDestructorDecl>(getFunctionDecl());
-    switch (getKind()) {
-    case CK_FunctionPointer:
-      return GlobalDecl(getFunctionDecl());
-    case CK_CompleteDtorPointer:
-      return GlobalDecl(DtorDecl, CXXDtorType::Dtor_Complete);
-    case CK_DeletingDtorPointer:
-      return GlobalDecl(DtorDecl, CXXDtorType::Dtor_Deleting);
-    case CK_VCallOffset:
-    case CK_VBaseOffset:
-    case CK_OffsetToTop:
-    case CK_RTTI:
-    case CK_UnusedFunctionPointer:
-      llvm_unreachable("Only function pointers kinds");
-    }
-    llvm_unreachable("Should already return");
-  }
-
-private:
   static bool isFunctionPointerKind(Kind ComponentKind) {
-    return isUsedFunctionPointerKind(ComponentKind) ||
-           ComponentKind == CK_UnusedFunctionPointer;
-  }
-  static bool isUsedFunctionPointerKind(Kind ComponentKind) {
     return ComponentKind == CK_FunctionPointer ||
-           isDestructorKind(ComponentKind);
-  }
-  static bool isDestructorKind(Kind ComponentKind) {
-    return ComponentKind == CK_CompleteDtorPointer ||
+           ComponentKind == CK_StaticFunctionPointer ||
+           ComponentKind == CK_StaticStdFunction ||
+           ComponentKind == CK_StaticLambda ||
+           ComponentKind == CK_CompleteDtorPointer ||
            ComponentKind == CK_DeletingDtorPointer;
   }
-  static bool isRTTIKind(Kind ComponentKind) {
-    return ComponentKind == CK_RTTI;
+
+  static bool isUsedFunctionPointerKind(Kind ComponentKind) {
+    return ComponentKind == CK_FunctionPointer ||
+           ComponentKind == CK_StaticFunctionPointer ||
+           ComponentKind == CK_StaticStdFunction ||
+           ComponentKind == CK_StaticLambda ||
+           ComponentKind == CK_CompleteDtorPointer ||
+           ComponentKind == CK_DeletingDtorPointer;
   }
 
-  VTableComponent(Kind ComponentKind, CharUnits Offset) {
-    assert((ComponentKind == CK_VCallOffset ||
-            ComponentKind == CK_VBaseOffset ||
-            ComponentKind == CK_OffsetToTop) && "Invalid component kind!");
-    assert(Offset.getQuantity() < (1LL << 56) && "Offset is too big!");
-    assert(Offset.getQuantity() >= -(1LL << 56) && "Offset is too small!");
+  bool operator==(const VTableComponent &Other) const {
+    if (TheKind != Other.TheKind)
+      return false;
 
-    Value = (uint64_t(Offset.getQuantity()) << 3) | ComponentKind;
+    // Check template parameters
+    if (TheKind == CK_TemplateParamInfo)
+      return TemplateParams == Other.TemplateParams &&
+             HasTemplateParams == Other.HasTemplateParams;
+
+    // Check offsets
+    if (TheKind == CK_VCallOffset || TheKind == CK_VBaseOffset ||
+        TheKind == CK_OffsetToTop)
+      return Offset == Other.Offset;
+
+    // Check static function components
+    if (isStaticKind()) {
+      return StaticFunc.FuncPtr == Other.StaticFunc.FuncPtr &&
+             StaticFunc.TemplateInfo == Other.StaticFunc.TemplateInfo &&
+             StaticFunc.InheritanceInfo == Other.StaticFunc.InheritanceInfo &&
+             IsMutable == Other.IsMutable &&
+             HasTemplateParams == Other.HasTemplateParams &&
+             IsVirtualInherited == Other.IsVirtualInherited;
+    }
+
+    // Default pointer comparison
+    return Ptr == Other.Ptr;
   }
 
-  VTableComponent(Kind ComponentKind, uintptr_t Ptr) {
-    assert((isRTTIKind(ComponentKind) || isFunctionPointerKind(ComponentKind)) &&
-           "Invalid component kind!");
-
-    assert((Ptr & 7) == 0 && "Pointer not sufficiently aligned!");
-
-    Value = Ptr | ComponentKind;
+  bool operator!=(const VTableComponent &Other) const {
+    return !(*this == Other);
   }
-
-  CharUnits getOffset() const {
-    assert((getKind() == CK_VCallOffset || getKind() == CK_VBaseOffset ||
-            getKind() == CK_OffsetToTop) && "Invalid component kind!");
-
-    return CharUnits::fromQuantity(Value >> 3);
-  }
-
-  uintptr_t getPointer() const {
-    assert((getKind() == CK_RTTI || isFunctionPointerKind()) &&
-           "Invalid component kind!");
-
-    return static_cast<uintptr_t>(Value & ~7ULL);
-  }
-
-  /// The kind is stored in the lower 3 bits of the value. For offsets, we
-  /// make use of the facts that classes can't be larger than 2^55 bytes,
-  /// so we store the offset in the lower part of the 61 bits that remain.
-  /// (The reason that we're not simply using a PointerIntPair here is that we
-  /// need the offsets to be 64-bit, even when on a 32-bit machine).
-  int64_t Value;
 };
 
 class VTableLayout {
@@ -236,31 +410,15 @@ public:
   struct AddressPointLocation {
     unsigned VTableIndex, AddressPointIndex;
   };
-  typedef llvm::DenseMap<BaseSubobject, AddressPointLocation>
-      AddressPointsMapTy;
-
-  // Mapping between the VTable index and address point index. This is useful
-  // when you don't care about the base subobjects and only want the address
-  // point for a given vtable index.
+  typedef llvm::DenseMap<BaseSubobject, AddressPointLocation> AddressPointsMapTy;
   typedef llvm::SmallVector<unsigned, 4> AddressPointsIndexMapTy;
 
 private:
-  // Stores the component indices of the first component of each virtual table in
-  // the virtual table group. To save a little memory in the common case where
-  // the vtable group contains a single vtable, an empty vector here represents
-  // the vector {0}.
   OwningArrayRef<size_t> VTableIndices;
-
   OwningArrayRef<VTableComponent> VTableComponents;
-
-  /// Contains thunks needed by vtables, sorted by indices.
   OwningArrayRef<VTableThunkTy> VTableThunks;
-
-  /// Address points for all vtables.
   AddressPointsMapTy AddressPoints;
-
-  /// Address points for all vtable indices.
-  AddressPointsIndexMapTy AddressPointIndices;
+  AddressPointsIndexMapTy AddressPointsIndex;
 
 public:
   VTableLayout(ArrayRef<size_t> VTableIndices,
@@ -277,43 +435,27 @@ public:
     return VTableThunks;
   }
 
-  AddressPointLocation getAddressPoint(BaseSubobject Base) const {
-    assert(AddressPoints.count(Base) && "Did not find address point!");
-    return AddressPoints.lookup(Base);
-  }
-
   const AddressPointsMapTy &getAddressPoints() const {
     return AddressPoints;
   }
 
-  const AddressPointsIndexMapTy &getAddressPointIndices() const {
-    return AddressPointIndices;
+  const AddressPointsIndexMapTy &getAddressPointsIndex() const {
+    return AddressPointsIndex;
   }
 
   size_t getNumVTables() const {
-    if (VTableIndices.empty())
-      return 1;
-    return VTableIndices.size();
+    return VTableIndices.empty() ? 1 : VTableIndices.size();
   }
 
   size_t getVTableOffset(size_t i) const {
-    if (VTableIndices.empty()) {
-      assert(i == 0);
-      return 0;
-    }
-    return VTableIndices[i];
+    return VTableIndices.empty() ? 0 : VTableIndices[i];
   }
 
   size_t getVTableSize(size_t i) const {
-    if (VTableIndices.empty()) {
-      assert(i == 0);
-      return vtable_components().size();
-    }
-
-    size_t thisIndex = VTableIndices[i];
-    size_t nextIndex = (i + 1 == VTableIndices.size())
-                           ? vtable_components().size()
-                           : VTableIndices[i + 1];
+    size_t thisIndex = getVTableOffset(i);
+    size_t nextIndex = (i + 1 == getNumVTables())
+                          ? VTableComponents.size()
+                          : getVTableOffset(i + 1);
     return nextIndex - thisIndex;
   }
 };
@@ -339,20 +481,7 @@ protected:
   VTableContextBase(bool MS) : IsMicrosoftABI(MS) {}
 
 public:
-  virtual const ThunkInfoVectorTy *getThunkInfo(GlobalDecl GD) {
-    const CXXMethodDecl *MD = cast<CXXMethodDecl>(GD.getDecl()->getCanonicalDecl());
-    computeVTableRelatedInformation(MD->getParent());
-
-    // This assumes that all the destructors present in the vtable
-    // use exactly the same set of thunks.
-    ThunksMapTy::const_iterator I = Thunks.find(MD);
-    if (I == Thunks.end()) {
-      // We did not find a thunk for this method.
-      return nullptr;
-    }
-
-    return &I->second;
-  }
+  virtual const ThunkInfoVectorTy *getThunkInfo(GlobalDecl GD);
 
   bool IsMicrosoftABI;
 
@@ -572,39 +701,6 @@ struct MethodVFTableLocation {
 
 class MicrosoftVTableContext : public VTableContextBase {
 public:
-
-private:
-  ASTContext &Context;
-
-  typedef llvm::DenseMap<GlobalDecl, MethodVFTableLocation>
-    MethodVFTableLocationsTy;
-  MethodVFTableLocationsTy MethodVFTableLocations;
-
-  typedef llvm::DenseMap<const CXXRecordDecl *, std::unique_ptr<VPtrInfoVector>>
-      VFPtrLocationsMapTy;
-  VFPtrLocationsMapTy VFPtrLocations;
-
-  typedef std::pair<const CXXRecordDecl *, CharUnits> VFTableIdTy;
-  typedef llvm::DenseMap<VFTableIdTy, std::unique_ptr<const VTableLayout>>
-      VFTableLayoutMapTy;
-  VFTableLayoutMapTy VFTableLayouts;
-
-  llvm::DenseMap<const CXXRecordDecl *, std::unique_ptr<VirtualBaseInfo>>
-      VBaseInfo;
-
-  void computeVTableRelatedInformation(const CXXRecordDecl *RD) override;
-
-  void dumpMethodLocations(const CXXRecordDecl *RD,
-                           const MethodVFTableLocationsTy &NewMethods,
-                           raw_ostream &);
-
-  const VirtualBaseInfo &
-  computeVBTableRelatedInformation(const CXXRecordDecl *RD);
-
-  void computeVTablePaths(bool ForVBTables, const CXXRecordDecl *RD,
-                          VPtrInfoVector &Paths);
-
-public:
   MicrosoftVTableContext(ASTContext &Context)
       : VTableContextBase(/*MS=*/true), Context(Context) {}
 
@@ -635,8 +731,62 @@ public:
   const VPtrInfoVector &enumerateVBTables(const CXXRecordDecl *RD);
 
   static bool classof(const VTableContextBase *VT) { return VT->isMicrosoft(); }
+
+  /// Get the address of a static function or lambda for VMT entry
+  const void *getStaticFunctionAddress(const FunctionDecl *FD) const;
+
+  /// Get the address of a std::function object for VMT entry
+  const void *getStdFunctionAddress(const FunctionDecl *FD,
+                                   const TemplateParameterList *TPL = nullptr) const;
+
+  /// Handle template parameter preservation for virtual methods
+  const TemplateParameterList *preserveTemplateParams(const CXXMethodDecl *MD,
+                                                     const CXXRecordDecl *Inherited = nullptr) const;
+
+  /// Support for virtual inheritance in VMT
+  bool hasVirtualBase(const CXXRecordDecl *RD) const;
+
+private:
+  ASTContext &Context;
+
+  typedef llvm::DenseMap<GlobalDecl, MethodVFTableLocation>
+    MethodVFTableLocationsTy;
+  MethodVFTableLocationsTy MethodVFTableLocations;
+
+  typedef llvm::DenseMap<const CXXRecordDecl *, std::unique_ptr<VPtrInfoVector>>
+      VFPtrLocationsMapTy;
+  VFPtrLocationsMapTy VFPtrLocations;
+
+  typedef std::pair<const CXXRecordDecl *, CharUnits> VFTableIdTy;
+  typedef llvm::DenseMap<VFTableIdTy, std::unique_ptr<const VTableLayout>>
+      VFTableLayoutMapTy;
+  VFTableLayoutMapTy VFTableLayouts;
+
+  llvm::DenseMap<const CXXRecordDecl *, std::unique_ptr<VirtualBaseInfo>>
+      VBaseInfo;
+
+  /// Maps for storing static function and template information
+  llvm::DenseMap<const FunctionDecl *, const void *> StaticFuncAddresses;
+  llvm::DenseMap<const CXXMethodDecl *, const TemplateParameterList *> TemplateParamMap;
+
+  void computeVTableRelatedInformation(const CXXRecordDecl *RD) override;
+
+  void dumpMethodLocations(const CXXRecordDecl *RD,
+                           const MethodVFTableLocationsTy &NewMethods,
+                           raw_ostream &);
+
+  const VirtualBaseInfo &
+  computeVBTableRelatedInformation(const CXXRecordDecl *RD);
+
+  void computeVTablePaths(bool ForVBTables, const CXXRecordDecl *RD,
+                          VPtrInfoVector &Paths);
+
+  /// Helper for dumping the vtable layout
+  void dumpMethodLocation(GlobalDecl GD,
+                         const VTableLayout &VTLayout,
+                         llvm::raw_ostream &OS) const;
 };
 
 } // namespace clang
 
-#endif
+#endif // LLVM_CLANG_AST_VTABLEBUILDER_H

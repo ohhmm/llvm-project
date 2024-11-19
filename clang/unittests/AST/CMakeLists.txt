@@ -43,6 +43,12 @@ add_clang_unittest(ASTTests
   TemplateNameTest.cpp
   TypePrinterTest.cpp
   UnresolvedSetTest.cpp
+  lambda-vmt.cpp
+  std-function-vmt.cpp
+  vtable-std-function-edge.cpp
+  vtable-std-function.cpp
+  vtable-template-param.cpp
+  vtable-virtual-inheritance.cpp
   )
 
 clang_target_link_libraries(ASTTests

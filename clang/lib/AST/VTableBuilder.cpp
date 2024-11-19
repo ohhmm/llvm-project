@@ -1,3 +1,4 @@
+
 //===--- VTableBuilder.cpp - C++ vtable layout builder --------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -29,6 +30,92 @@ using namespace clang;
 #define DUMP_OVERRIDERS 0
 
 namespace {
+
+/// VTableAddressResolver - Helper class to resolve static function addresses
+/// for virtual method table entries.
+class VTableAddressResolver {
+  ASTContext &Context;
+
+public:
+  VTableAddressResolver(ASTContext &Ctx) : Context(Ctx) {}
+
+  /// Get the actual function address for a static function
+  void *getStaticFunctionAddress(const FunctionDecl *FD, bool IsVirtual = false) const {
+    if (!FD) return nullptr;
+    // For virtual functions, we need to ensure proper vtable layout
+    if (IsVirtual && isa<CXXMethodDecl>(FD)) {
+      const auto *MD = cast<CXXMethodDecl>(FD);
+      if (MD->isVirtual())
+        return Context.getVTableContext().getMethodVTableIndex(GlobalDecl(MD));
+    }
+    return Context.getFunctionAddress(FD);
+  }
+
+  /// Get the address of a lambda's call operator with template support
+  void *getLambdaAddress(const CXXMethodDecl *CallOp,
+                        const TemplateParameterList *TPL = nullptr,
+                        bool IsMutable = false,
+                        const CXXRecordDecl *InheritedFrom = nullptr) const {
+    if (!CallOp || !CallOp->getParent()->isLambda())
+      return nullptr;
+
+    // For mutable lambdas, we need to store the instance
+    if (IsMutable) {
+      return Context.getLambdaInstanceAddress(CallOp);
+    }
+
+    // Handle template parameters if present
+    if (TPL) {
+      return Context.getTemplateFunctionAddress(CallOp, TPL);
+    }
+
+    // Handle inheritance cases
+    if (InheritedFrom) {
+      return Context.getInheritedFunctionAddress(CallOp, InheritedFrom);
+    }
+
+    return Context.getFunctionAddress(CallOp);
+  }
+
+  /// Get the address of a std::function object with template support
+  void *getStdFunctionAddress(const FunctionDecl *FD,
+                             const TemplateParameterList *TPL = nullptr,
+                             const CXXRecordDecl *InheritedFrom = nullptr) const {
+    if (!FD) return nullptr;
+
+    // Handle template parameters if present
+    if (TPL) {
+      return Context.getTemplateFunctionAddress(FD, TPL);
+    }
+
+    // Handle inheritance cases
+    if (InheritedFrom) {
+      return Context.getInheritedFunctionAddress(FD, InheritedFrom);
+    }
+
+    return Context.getFunctionAddress(FD);
+  }
+
+  /// Get the address for a virtual method with template parameters
+  void *getVirtualMethodAddress(const CXXMethodDecl *MD,
+                               const TemplateParameterList *TPL = nullptr,
+                               const CXXRecordDecl *InheritedFrom = nullptr) const {
+    if (!MD || !MD->isVirtual())
+      return nullptr;
+
+    // Handle template parameters if present
+    if (TPL) {
+      return Context.getTemplateFunctionAddress(MD, TPL);
+    }
+
+    // Handle inheritance cases
+    if (InheritedFrom) {
+      return Context.getInheritedFunctionAddress(MD, InheritedFrom);
+    }
+
+    return Context.getFunctionAddress(MD);
+  }
+};
 
 /// BaseOffset - Represents an offset from a derived class to a direct or
 /// indirect base class.
@@ -850,16 +937,39 @@ private:
     /// (For destructors, this is the index of the complete destructor).
     const uint64_t VTableIndex;
 
+    /// StaticFuncPtr - The static function pointer if this is a static function
+    const void *StaticFuncPtr;
+
+    /// TemplateParams - Template parameters for this method
+    const TemplateParameterList *TemplateParams;
+
+    /// InheritedFrom - The class this method was inherited from (if any)
+    const CXXRecordDecl *InheritedFrom;
+
+    /// IsMutableLambda - Whether this is a mutable lambda
+    bool IsMutableLambda;
+
     MethodInfo(CharUnits BaseOffset, CharUnits BaseOffsetInLayoutClass,
-               uint64_t VTableIndex)
+               uint64_t VTableIndex, const void *StaticFuncPtr = nullptr,
+               const TemplateParameterList *TPL = nullptr,
+               const CXXRecordDecl *InheritedFrom = nullptr,
+               bool IsMutableLambda = false)
       : BaseOffset(BaseOffset),
-      BaseOffsetInLayoutClass(BaseOffsetInLayoutClass),
-      VTableIndex(VTableIndex) { }
+        BaseOffsetInLayoutClass(BaseOffsetInLayoutClass),
+        VTableIndex(VTableIndex),
+        StaticFuncPtr(StaticFuncPtr),
+        TemplateParams(TPL),
+        InheritedFrom(InheritedFrom),
+        IsMutableLambda(IsMutableLambda) { }
 
     MethodInfo()
       : BaseOffset(CharUnits::Zero()),
-      BaseOffsetInLayoutClass(CharUnits::Zero()),
-      VTableIndex(0) { }
+        BaseOffsetInLayoutClass(CharUnits::Zero()),
+        VTableIndex(0),
+        StaticFuncPtr(nullptr),
+        TemplateParams(nullptr),
+        InheritedFrom(nullptr),
+        IsMutableLambda(false) { }
 
     MethodInfo(MethodInfo const&) = default;
   };
@@ -1346,12 +1456,58 @@ void ItaniumVTableBuilder::AddMethod(const CXXMethodDecl *MD,
     Components.push_back(VTableComponent::MakeCompleteDtor(DD));
     Components.push_back(VTableComponent::MakeDeletingDtor(DD));
   } else {
-    // Add the return adjustment if necessary.
-    if (!ReturnAdjustment.isEmpty())
-      VTableThunks[Components.size()].Return = ReturnAdjustment;
+    // Check for static methods, lambdas, and std::function objects
+    if (MD->isStatic()) {
+      Components.push_back(VTableComponent::MakeStaticFunction(MD, Context));
+    } else if (const auto *Parent = MD->getParent()) {
+      if (Parent->isLambda()) {
+        // Handle mutable lambdas
+        if (Parent->getLambdaCallOperator()->isMutable()) {
+          // Store lambda instance for mutable lambdas
+          Components.push_back(VTableComponent::MakeStaticLambda(MD, Context));
+        } else {
+          Components.push_back(VTableComponent::MakeStaticLambda(MD, Context));
+        }
+      } else if (const auto *Conv = dyn_cast<CXXConversionDecl>(MD)) {
+        QualType ConvType = Conv->getConversionType();
+        if (const auto *RD = ConvType->getAsCXXRecordDecl()) {
+          if (RD->getQualifiedNameAsString() == "std::function") {
+            Components.push_back(VTableComponent::MakeStaticStdFunction(MD, Context));
+          }
+        }
+      } else {
+        // Handle virtual inheritance and multiple inheritance
+        if (const auto *VBase = dyn_cast<CXXRecordDecl>(Parent)) {
+          if (VBase->getNumVBases() > 0) {
+            // Add virtual base adjustments
+            for (const auto &VBI : VBase->vbases()) {
+              const CXXRecordDecl *VBaseDecl = VBI.getType()->getAsCXXRecordDecl();
+              if (VBaseDecl && VBaseDecl->isDynamicClass()) {
+                Components.push_back(
+                    VTableComponent::MakeVBaseOffset(
+                        Context.getASTRecordLayout(VBase).getVBaseClassOffset(VBaseDecl)));
+              }
+            }
+          }
+        }
 
-    // Add the function.
-    Components.push_back(VTableComponent::MakeFunction(MD));
+        // Add the return adjustment if necessary.
+        if (!ReturnAdjustment.isEmpty())
+          VTableThunks[Components.size()].Return = ReturnAdjustment;
+
+        // Add as regular function.
+        Components.push_back(VTableComponent::MakeFunction(MD));
+      }
+    }
+  }
+
+  // Add template parameter information if available
+  if (const auto *Template = MD->getDescribedFunctionTemplate()) {
+    if (const auto *Params = Template->getTemplateParameters()) {
+      if (Params->size() > 0) {
+        Components.push_back(VTableComponent::MakeTemplateParamInfo(Params));
+      }
+    }
   }
 }
 
@@ -1527,6 +1683,55 @@ void ItaniumVTableBuilder::AddMethods(
     if (!ItaniumVTableContext::hasVtableSlot(MD))
       continue;
     MD = MD->getCanonicalDecl();
+
+    // Handle static functions, lambdas, and std::function objects
+    if (MD->isStatic()) {
+      Components.push_back(VTableComponent::MakeStaticFunction(MD, Context,
+                                                           /*Addr=*/nullptr,
+                                                           /*InheritedFrom=*/RD,
+                                                           /*IsVirtual=*/false));
+      continue;
+    }
+
+    const auto *Parent = MD->getParent();
+    if (Parent && Parent->isLambda()) {
+      bool IsMutable = cast<CXXMethodDecl>(MD)->isLambdaStaticInvoker();
+      Components.push_back(VTableComponent::MakeStaticLambda(MD, Context,
+                                                         IsMutable,
+                                                         /*Addr=*/nullptr,
+                                                         /*InheritedFrom=*/RD,
+                                                         /*IsVirtual=*/false));
+      continue;
+    }
+
+    if (const auto *Conv = dyn_cast<CXXConversionDecl>(MD)) {
+      QualType ConvType = Conv->getConversionType();
+      if (const auto *ConvRD = ConvType->getAsCXXRecordDecl()) {
+        if (ConvRD->getQualifiedNameAsString() == "std::function") {
+          // Get template parameters if this is a template specialization
+          const TemplateParameterList *TPL = nullptr;
+          if (const auto *TST = dyn_cast<ClassTemplateSpecializationDecl>(ConvRD)) {
+            if (const auto *TD = TST->getSpecializedTemplate()) {
+              TPL = TD->getTemplateParameters();
+            }
+          }
+          Components.push_back(VTableComponent::MakeStaticStdFunction(MD, Context,
+                                                                  TPL,
+                                                                  /*Addr=*/nullptr,
+                                                                  /*InheritedFrom=*/RD));
+          continue;
+        }
+      }
+    }
+
+    // Handle template parameters
+    if (const auto *Template = MD->getDescribedFunctionTemplate()) {
+      if (TemplateParameterList *Params = Template->getTemplateParameters()) {
+        if (Params->size() > 0) {
+          Components.push_back(VTableComponent::MakeTemplateParamInfo(Params, RD));
+        }
+      }
+    }
 
     // Get the final overrider.
     FinalOverriders::OverriderInfo Overrider =
@@ -2015,6 +2220,10 @@ void ItaniumVTableBuilder::dumpLayout(raw_ostream &Out) {
       Out << " RTTI";
       break;
 
+    case VTableComponent::CK_TemplateParamInfo:
+      Out << "template_param_info";
+      break;
+
     case VTableComponent::CK_FunctionPointer: {
       const CXXMethodDecl *MD = Component.getFunctionDecl();
 
@@ -2094,6 +2303,31 @@ void ItaniumVTableBuilder::dumpLayout(raw_ostream &Out) {
         printThunkMethod(Thunk, Out);
       }
 
+      break;
+    }
+
+    case VTableComponent::CK_StdFunction: {
+      const FunctionDecl *FD = Component.getStdFunctionDecl();
+      std::string Str;
+      if (auto *MD = dyn_cast<CXXMethodDecl>(FD)) {
+        Str = PredefinedExpr::ComputeName(
+            PredefinedIdentKind::PrettyFunctionNoVirtual, MD);
+      } else {
+        Str = FD->getNameAsString();
+      }
+      Out << "[std::function] " << Str;
+      if (Component.hasTemplateParams())
+        Out << " [templated]";
+      break;
+    }
+
+    case VTableComponent::CK_Lambda: {
+      const CXXMethodDecl *MD = Component.getLambdaDecl();
+      std::string Str = PredefinedExpr::ComputeName(
+          PredefinedIdentKind::PrettyFunctionNoVirtual, MD);
+      Out << "[lambda] " << Str;
+      if (Component.hasTemplateParams())
+        Out << " [templated]";
       break;
     }
 
